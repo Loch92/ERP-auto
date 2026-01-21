@@ -1,26 +1,64 @@
+# app.py
+# Full Streamlit system (ALL features)
+# Inputs:
+#   1) Timetable CSV (software export)
+#   2) Lec Codes.xlsx (Code -> User name)
+#   3) (Optional) CBS Template Excel (CBSTimeTableTemplate*.xlsx)
+#
+# Outputs:
+#   A) ERP Week output (CSV + Excel) in Week1 format + Group Name column
+#   B) CBS filled template (Excel) using "EntrySheet"
+#
+# Extras:
+#   - Intake label is editable (text box)
+#   - Column-wise editing via st.data_editor (download the edited file)
+#   - Optional: auto-regenerate Group Name when intake label changes
+
 import re
 from io import BytesIO
 from datetime import datetime, timedelta
 
 import pandas as pd
 import streamlit as st
+
+# openpyxl is required for Excel template writing
 import openpyxl
 
 st.set_page_config(page_title="Timetable → ERP + CBS Outputs", layout="wide")
 st.title("📅 Timetable CSV → ERP Upload + CBS Template Output (Full System)")
 
 # -----------------------------
-# ERP Week output schema (your Week1 format)
+# ERP output columns (Week1 style) + Group Name added
 # -----------------------------
 ERP_OUTPUT_COLS = [
-    "Activity Id", "Day", "Hour", "Students Sets", "Group Name", "Subject",
-    "Teachers", "Teacher1", "Activity Tags", "Room", "Comments"
+    "Activity Id",
+    "Day",
+    "Hour",
+    "Students Sets",
+    "Group Name",
+    "Subject",
+    "Teachers",
+    "Teacher1",
+    "Activity Tags",
+    "Room",
+    "Comments",
 ]
 
-# CBS Template headers (from your template EntrySheet)
+# -----------------------------
+# CBS template columns (from your CBSTimeTableTemplate EntrySheet)
+# -----------------------------
 CBS_COLS = [
-    "Cal Id", "Course", "Course Variant", "Section", "Room", "Faculty",
-    "Day", "From Time Slot", "To Time Slot", "AcademyLocationID", "isAllFaculties"
+    "Cal Id",
+    "Course",
+    "Course Variant",
+    "Section",
+    "Room",
+    "Faculty",
+    "Day",
+    "From Time Slot",
+    "To Time Slot",
+    "AcademyLocationID",
+    "isAllFaculties",
 ]
 
 # -----------------------------
@@ -31,6 +69,9 @@ def norm(s) -> str:
         return ""
     return re.sub(r"\s+", " ", str(s)).strip()
 
+def normalize_students_sets(s: str) -> str:
+    return norm(s)
+
 def split_teacher_codes(raw_teachers: str):
     # "BALA+SHK" -> ["BALA","SHK"]
     if pd.isna(raw_teachers) or raw_teachers is None:
@@ -38,12 +79,18 @@ def split_teacher_codes(raw_teachers: str):
     return [t.strip() for t in str(raw_teachers).split("+") if t.strip()]
 
 def build_code_to_username_map(lec_df: pd.DataFrame) -> dict:
+    """
+    Lec Codes.xlsx expected columns:
+      - Code
+      - User name (ERP username like IITxxxx/Name or 7000xx/Name)
+    """
     lec_df = lec_df.copy()
     lec_df.columns = [c.strip() for c in lec_df.columns]
+
     required = {"Code", "User name"}
     missing = [c for c in required if c not in lec_df.columns]
     if missing:
-        raise ValueError(f"Lec Codes.xlsx missing columns: {missing} (need Code + User name)")
+        raise ValueError(f"Lec Codes.xlsx missing columns: {missing}. Required: {sorted(required)}")
 
     lec_df["Code"] = lec_df["Code"].astype(str).map(norm).str.upper()
     lec_df["User name"] = lec_df["User name"].astype(str).map(norm)
@@ -53,9 +100,8 @@ def build_code_to_username_map(lec_df: pd.DataFrame) -> dict:
 
 def map_teachers(raw_teachers: str, code_map: dict):
     """
-    Returns:
-      Teachers(main), Teacher1(second), unknown(list), extras(list beyond 2)
-    Unknown kept as-is (e.g., TBA 2)
+    Returns: main, teacher1, unknown(list), extras(list beyond 2)
+    Unknown codes kept as-is (e.g., TBA 2)
     """
     codes = split_teacher_codes(raw_teachers)
     mapped, unknown = [], []
@@ -72,7 +118,6 @@ def map_teachers(raw_teachers: str, code_map: dict):
     extras = mapped[2:] if len(mapped) > 2 else []
     return main, t1, unknown, extras
 
-# ----- Group Name relationship (Students Sets -> PDF style group name)
 def extract_groups(students_sets: str):
     """
     From: 'L5 CS -G1+L5 CS -G2+L5 CS -G21+L5 SE -G10'
@@ -96,7 +141,7 @@ def extract_groups(students_sets: str):
         out[prog] = sorted(set(out[prog]))
     return out
 
-def build_group_name(students_sets: str, intake_label: str = "L5 Jan 26"):
+def build_group_name(students_sets: str, intake_label: str):
     """
     PDF style:
       - L5 Jan 26 SE- 1,2,4
@@ -119,10 +164,21 @@ def build_group_name(students_sets: str, intake_label: str = "L5 Jan 26"):
         return fmt("SE")
     return fmt("CS")
 
-# ----- Course Variant from Activity Tags
+def ensure_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    out = df.copy()
+    for c in cols:
+        if c not in out.columns:
+            out[c] = ""
+    return out[cols]
+
+def df_to_excel_bytes(df: pd.DataFrame, sheet_name="ERP") -> bytes:
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    return bio.getvalue()
+
 def infer_course_variant(activity_tags: str) -> str:
     s = norm(activity_tags).upper()
-    # You can extend rules here
     if "LAB" in s:
         return "Lab"
     if "TUT" in s:
@@ -131,24 +187,23 @@ def infer_course_variant(activity_tags: str) -> str:
         return "Lecture"
     return ""
 
-# ----- Build session blocks (From/To) from hourly rows
 def parse_time_hhmm(t: str) -> datetime:
-    # expects "08:30"
     return datetime.strptime(t.strip(), "%H:%M")
 
 def fmt_time_hhmmss(dt: datetime) -> str:
     return dt.strftime("%H:%M:%S")
 
-def build_sessions_for_cbs(df_erp_like: pd.DataFrame):
+def build_sessions_for_cbs(df_hourly: pd.DataFrame) -> pd.DataFrame:
     """
-    Your Week-style data has one row per hour.
-    CBS template needs From/To timeslots per session.
-    Group by session keys, merge consecutive hours, compute end = last_hour + 1 hour.
+    CBS needs From/To times. Your timetable is hourly.
+    We group by session keys, merge consecutive hours:
+      start = first hour
+      end   = last hour + 1 hour
     """
-    df = df_erp_like.copy()
+    df = df_hourly.copy()
     df["Hour"] = df["Hour"].map(norm)
 
-    session_keys = ["Activity Id", "Day", "Students Sets", "Subject", "Room", "Teachers", "Teacher1", "Activity Tags"]
+    session_keys = ["Activity Id", "Day", "Students Sets", "Group Name", "Subject", "Room", "Teachers", "Teacher1", "Activity Tags"]
     for c in session_keys:
         if c not in df.columns:
             df[c] = ""
@@ -168,27 +223,24 @@ def build_sessions_for_cbs(df_erp_like: pd.DataFrame):
 
     return pd.DataFrame(sessions)
 
-def df_to_excel_bytes_simple(df: pd.DataFrame, sheet_name="ERP") -> bytes:
-    bio = BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name)
-    return bio.getvalue()
-
 def write_cbs_template(template_bytes: bytes, cbs_df: pd.DataFrame) -> bytes:
     """
-    Fill template EntrySheet starting row 2 (row 1 = headers).
-    Keep template formatting & validations.
+    Fill template sheet 'EntrySheet' from row 2 down (row1 headers).
+    Keeps template formatting and validations.
     """
-    bio_in = BytesIO(template_bytes)
-    wb = openpyxl.load_workbook(bio_in)
+    wb = openpyxl.load_workbook(BytesIO(template_bytes))
+    if "EntrySheet" not in wb.sheetnames:
+        raise ValueError("CBS template does not contain a sheet named 'EntrySheet'.")
+
     ws = wb["EntrySheet"]
 
-    # Clear existing rows from row 2 downward (safe)
+    # Clear existing data rows (row 2 onwards)
     if ws.max_row >= 2:
         ws.delete_rows(2, ws.max_row - 1)
 
     # Write rows
-    for i, rec in enumerate(cbs_df.to_dict("records"), start=2):
+    records = cbs_df.to_dict("records")
+    for i, rec in enumerate(records, start=2):
         for j, col in enumerate(CBS_COLS, start=1):
             ws.cell(row=i, column=j).value = rec.get(col, "")
 
@@ -197,7 +249,7 @@ def write_cbs_template(template_bytes: bytes, cbs_df: pd.DataFrame) -> bytes:
     return out_bio.getvalue()
 
 # -----------------------------
-# UI
+# UI: uploads
 # -----------------------------
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -205,25 +257,37 @@ with c1:
 with c2:
     lec_codes_file = st.file_uploader("2) Lec Codes.xlsx", type=["xlsx"])
 with c3:
-    cbs_template_file = st.file_uploader("3) CBS Template Excel (your file)", type=["xlsx"])
+    cbs_template_file = st.file_uploader("3) CBS Template Excel (optional)", type=["xlsx"])
 
 st.subheader("Settings")
-intake_label = st.text_input("Intake label for Group Name", value="L5 Jan 26")
+intake_label = st.text_input("Intake label for Group Name (user can change)", value="L5 Jan 26")
+auto_regen_group = st.checkbox("Auto-regenerate Group Name using Intake label", value=True)
 put_extras_in_comments = st.checkbox("If >2 lecturers, append extras into Comments", value=True)
+
+st.subheader("CBS Settings (optional)")
 duplicate_rows_for_teacher1_in_cbs = st.checkbox("CBS: If Teacher1 exists, create another CBS row", value=True)
+default_is_all_faculties = st.selectbox("CBS: isAllFaculties", options=["FALSE", "TRUE"], index=0)
 
 st.divider()
 
 # -----------------------------
-# Run
+# Main processing
 # -----------------------------
 if timetable_file and lec_codes_file:
     # Load inputs
-    df_raw = pd.read_csv(timetable_file)
-    lec_df = pd.read_excel(lec_codes_file)
-    code_map = build_code_to_username_map(lec_df)
+    try:
+        df_raw = pd.read_csv(timetable_file)
+    except Exception as e:
+        st.error(f"Could not read timetable CSV: {e}")
+        st.stop()
 
-    # Validate timetable columns
+    try:
+        lec_df = pd.read_excel(lec_codes_file)
+        code_map = build_code_to_username_map(lec_df)
+    except Exception as e:
+        st.error(f"Could not read Lec Codes.xlsx or build mapping: {e}")
+        st.stop()
+
     required_cols = ["Activity Id", "Day", "Hour", "Students Sets", "Subject", "Teachers", "Activity Tags", "Room"]
     missing = [c for c in required_cols if c not in df_raw.columns]
     if missing:
@@ -231,100 +295,115 @@ if timetable_file and lec_codes_file:
         st.stop()
 
     out = df_raw.copy()
-    out["Students Sets"] = out["Students Sets"].map(norm)
-    out["Comments"] = out["Comments"] if "Comments" in out.columns else ""
+    out["Students Sets"] = out["Students Sets"].map(normalize_students_sets)
+
+    if "Comments" not in out.columns:
+        out["Comments"] = ""
 
     # Lecturer mapping
     unknown_all = set()
     extra_total = 0
-    t_main, t1_list, comm_list = [], [], []
+    new_teachers, new_teacher1, new_comments = [], [], []
 
     for _, row in out.iterrows():
         main, t1, unknown, extras = map_teachers(row["Teachers"], code_map)
-        t_main.append(main)
-        t1_list.append(t1)
+        new_teachers.append(main)
+        new_teacher1.append(t1)
+
         for u in unknown:
             unknown_all.add(u)
 
         comment = norm(row.get("Comments", ""))
+
         if extras:
             extra_total += len(extras)
             if put_extras_in_comments:
                 extra_txt = "Extra lecturers: " + " + ".join(extras)
                 comment = (comment + " | " + extra_txt).strip(" |") if comment else extra_txt
-        comm_list.append(comment)
 
-    out["Teachers"] = t_main
-    out["Teacher1"] = t1_list
-    out["Comments"] = comm_list
+        new_comments.append(comment)
+
+    out["Teachers"] = new_teachers
+    out["Teacher1"] = new_teacher1
+    out["Comments"] = new_comments
 
     # Group Name
-    out["Group Name"] = out["Students Sets"].apply(lambda s: build_group_name(s, intake_label=intake_label))
+    if auto_regen_group:
+        out["Group Name"] = out["Students Sets"].apply(lambda s: build_group_name(s, intake_label=intake_label))
+    else:
+        if "Group Name" not in out.columns:
+            out["Group Name"] = ""
 
-    # Enforce ERP output columns
-    for c in ERP_OUTPUT_COLS:
-        if c not in out.columns:
-            out[c] = ""
-    out_erp = out[ERP_OUTPUT_COLS].copy()
+    # Enforce ERP output format + column order
+    out_erp = ensure_columns(out, ERP_OUTPUT_COLS)
 
-    st.success("✅ ERP Week output generated.")
+    st.success("✅ ERP table generated. You can edit it below before downloading.")
+
     if unknown_all:
         st.warning("Lecturer codes not found in Lec Codes.xlsx (kept as-is): " + ", ".join(sorted(unknown_all)))
     if extra_total > 0 and not put_extras_in_comments:
-        st.warning("Extra lecturers beyond Teacher1 were found but not included (enable checkbox).")
+        st.warning("Extra lecturers beyond Teacher1 exist but were not included (enable checkbox).")
 
-    st.subheader("Preview: ERP Week Output")
-    st.dataframe(out_erp, use_container_width=True)
+    # -----------------------------
+    # Editable preview (column-wise editing)
+    # -----------------------------
+    st.subheader("Edit before download (click any cell to edit)")
+    edited_erp = st.data_editor(
+        out_erp,
+        use_container_width=True,
+        num_rows="dynamic",
+        hide_index=True,
+    )
 
-    # Downloads for ERP
-    colA, colB = st.columns(2)
-    with colA:
+    # Downloads (edited)
+    st.subheader("Download edited ERP output")
+    d1, d2 = st.columns(2)
+    with d1:
         st.download_button(
-            "⬇️ Download ERP CSV",
-            data=out_erp.to_csv(index=False).encode("utf-8"),
-            file_name="ERP_ready_week.csv",
+            "⬇️ Download ERP CSV (edited)",
+            data=edited_erp.to_csv(index=False).encode("utf-8"),
+            file_name="ERP_ready_week_edited.csv",
             mime="text/csv",
         )
-    with colB:
+    with d2:
         st.download_button(
-            "⬇️ Download ERP Excel",
-            data=df_to_excel_bytes_simple(out_erp, sheet_name="ERP"),
-            file_name="ERP_ready_week.xlsx",
+            "⬇️ Download ERP Excel (edited)",
+            data=df_to_excel_bytes(edited_erp, sheet_name="ERP"),
+            file_name="ERP_ready_week_edited.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
     # -----------------------------
-    # CBS Output
+    # CBS output (optional)
     # -----------------------------
     st.divider()
-    st.subheader("CBS Template Output")
+    st.subheader("CBS Template Output (optional)")
 
-    # Build session-level rows (From/To)
-    sessions = build_sessions_for_cbs(out_erp)
+    # Build sessions from EDITED ERP (so CBS respects your edits)
+    sessions = build_sessions_for_cbs(edited_erp)
 
     if sessions.empty:
-        st.error("Could not build CBS sessions (check Hour column format like 08:30, 09:30, etc.)")
+        st.error("Could not build CBS sessions. Check 'Hour' format (must be like 08:30, 09:30...).")
         st.stop()
 
-    # Build CBS dataframe with correct headers
+    # Create CBS rows
     cbs_rows = []
     for _, r in sessions.iterrows():
         base = {
-            "Cal Id": "",  # leave blank unless you have a value
+            "Cal Id": "",
             "Course": norm(r.get("Subject", "")),
             "Course Variant": infer_course_variant(r.get("Activity Tags", "")),
-            "Section": norm(r.get("Group Name", "")),          # ✅ relationship applied here
+            "Section": norm(r.get("Group Name", "")),  # relationship applied here
             "Room": norm(r.get("Room", "")),
             "Faculty": norm(r.get("Teachers", "")),
             "Day": norm(r.get("Day", "")),
             "From Time Slot": r.get("From Time Slot", ""),
             "To Time Slot": r.get("To Time Slot", ""),
-            "AcademyLocationID": "",  # optional (you can map from room prefix if needed)
-            "isAllFaculties": "FALSE"
+            "AcademyLocationID": "",
+            "isAllFaculties": default_is_all_faculties,
         }
         cbs_rows.append(base)
 
-        # If Teacher1 exists, optionally create another row
         t1 = norm(r.get("Teacher1", ""))
         if duplicate_rows_for_teacher1_in_cbs and t1:
             base2 = base.copy()
@@ -337,17 +416,20 @@ if timetable_file and lec_codes_file:
             cbs_df[c] = ""
     cbs_df = cbs_df[CBS_COLS].copy()
 
-    st.write("Preview: CBS rows")
+    st.write("CBS Preview (you can download filled template if you uploaded it):")
     st.dataframe(cbs_df, use_container_width=True)
 
     if cbs_template_file:
-        filled_bytes = write_cbs_template(cbs_template_file.getvalue(), cbs_df)
-        st.download_button(
-            "⬇️ Download CBS Filled Template (Excel)",
-            data=filled_bytes,
-            file_name="CBS_Timetable_Filled.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        try:
+            filled_bytes = write_cbs_template(cbs_template_file.getvalue(), cbs_df)
+            st.download_button(
+                "⬇️ Download CBS Filled Template (Excel)",
+                data=filled_bytes,
+                file_name="CBS_Timetable_Filled.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as e:
+            st.error(f"Could not fill CBS template: {e}")
     else:
         st.info("Upload the CBS template Excel to download a filled version (format preserved).")
 
